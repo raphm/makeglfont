@@ -117,6 +117,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
+
+The font `mensch.ttf` is from http://robey.lag.net/2010/06/21/mensch-font.html.
+
 Some portions of this code come from freetype-gl:
 
 /* =========================================================================
