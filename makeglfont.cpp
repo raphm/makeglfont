@@ -53,14 +53,93 @@ const struct {
 } FT_Errors[] =
 #include FT_ERRORS_H
 
-void print_fterr(int error, int line) {
-    if( error )
-    {
-        fprintf( stderr, "FT_Error (line %d, code 0x%02x) : %s\n",
-                __LINE__, FT_Errors[error].code, FT_Errors[error].message);
-        exit(1);
+// A little wrapper class to handle FreeType resource cleanup and whatnot.
+// I don't love these, but they tend to keep things simpler later.
+// Plus, Bjarne tells me RAII is the way to go!  :)
+class ftwrapper {
+public:
+    FT_Library library;
+    FT_Face face;
+    FT_Error error;
+    bool valid;
+    
+    inline void check_fterr() {
+        if( error )
+        {
+            valid = false;
+            fprintf( stderr, "FT_Error (code 0x%02x) : %s\n",
+                    FT_Errors[error].code, FT_Errors[error].message);
+        }
     }
-}
+    
+    ftwrapper(std::string fontfile):valid(true) {
+        this->error = FT_Init_FreeType( &this->library );
+        check_fterr();
+        if( error ) { exit(1); }
+
+        this->error = FT_New_Face( this->library, fontfile.c_str(), 0, &this->face );
+        check_fterr();
+        if( error ) { exit(1); }
+
+        this->error = FT_Select_Charmap( this->face, FT_ENCODING_UNICODE );
+        check_fterr();
+        if( error ) { exit(1); }
+    }
+    
+    ~ftwrapper() {
+        FT_Done_Face( face );
+        FT_Done_FreeType( library );
+    }
+    
+    inline bool set_pixel_size(int pixel_size) {
+        if(valid) {
+            error = FT_Set_Pixel_Sizes(face, 0, pixel_size);
+            check_fterr();
+        }
+        return (valid && !error);
+    }
+    
+    inline bool load_glyph(FT_UInt glyph_index) {
+        if(valid) {
+            error = FT_Load_Glyph( face, glyph_index, FT_LOAD_NO_HINTING | FT_LOAD_NO_AUTOHINT);
+            check_fterr();
+        }
+        return (valid && !error);
+    }
+    
+    inline bool render_glyph() {
+        if(valid) {
+            error = FT_Render_Glyph( face->glyph, FT_RENDER_MODE_NORMAL );
+            check_fterr();
+        }
+        return (valid && !error);
+    }
+    
+    inline FT_UInt get_char_index(FT_ULong charcode ) {
+        if(valid)
+            return FT_Get_Char_Index( face, charcode );
+        else
+            return 0;
+    }
+
+    inline FT_GlyphSlot glyph() {
+        return face->glyph;
+    }
+    
+    inline FT_Size_Metrics get_metrics() {
+        return face->size->metrics;
+    }
+    
+    inline bool get_kerning( FT_UInt prev_index, FT_UInt cur_index, FT_Vector & kerning ) {
+        return !FT_Get_Kerning(face, prev_index, cur_index, FT_KERNING_DEFAULT, &kerning );
+    }
+
+private:
+    ftwrapper&  operator = (const ftwrapper& ftw);
+    ftwrapper(const ftwrapper& ftw);
+};
+
+
 
 // Nemanja Trifunovic's UTF-8 translation headers.
 #include "utf8.h"
@@ -79,7 +158,22 @@ void print_fterr(int error, int line) {
 // Freetype GL functions
 #include "distance_map.h"
 
-#include "makeglfont.h"
+#include "fbitmap.h"
+
+// See http://www.freetype.org/freetype2/docs/glyphs/glyphs-3.html for glyph metrics description
+
+struct glyph
+{
+    uint32_t charcode;
+    float bbox_width, bbox_height; // width and height of bbox in pixels
+    float bearing_x; // offset from current pen position to glyph's left bbox edge
+    float bearing_y; // offset from baseline to top of glyph's bbox
+    float advance_x; // horizontal distance to increment pen position when glyph is drawn
+    fbitmap<unsigned char> bmp;
+    std::map<uint32_t, float> kernings; // map of kern pairs relative to this glyph;
+    // <previous character in character pair, kern value in pixels>
+    float s0, t0, s1, t1; // final texture coordinates after packing.
+};
 
 inline void utf_append(uint32_t cp, std::string & result) {
     char s[8];
@@ -100,10 +194,10 @@ inline void utf_append(uint32_t cp, std::string & result) {
  * large bitmap. It returns a glyph filled with the scaled-down glyph
  * metrics and the scaled-down (resampled) signed distance field.
  */
-glyph load_glyph(FT_Face face, FT_ULong charcode, int font_size, int sdf_scale) {
+glyph load_glyph(ftwrapper & ftw, FT_ULong charcode, int font_size, int sdf_scale) {
         
     // retrieve glyph index from character code
-    FT_UInt glyph_index = FT_Get_Char_Index( face, charcode );
+    FT_UInt glyph_index = ftw.get_char_index( charcode );
     
     if(glyph_index == 0) {
         std::string errstr;
@@ -113,47 +207,28 @@ glyph load_glyph(FT_Face face, FT_ULong charcode, int font_size, int sdf_scale) 
     }
     
     // load glyph image into the slot, erasing previous image
-    FT_Error error = 0;
-
-    error = FT_Set_Pixel_Sizes(face, font_size*sdf_scale, 0);
     
-    if( error )
-    {
-        FT_Done_Face( face );
-        print_fterr(error, __LINE__);
-    }
-    
-    error = FT_Load_Glyph( face, glyph_index, FT_LOAD_NO_HINTING | FT_LOAD_NO_AUTOHINT);
-    
-    if ( error ) {
-        FT_Done_Face( face );
-        print_fterr(error, __LINE__);
-    }
-
-    error = FT_Render_Glyph( face->glyph, FT_RENDER_MODE_NORMAL );
-    
-    if ( error ) {
-        FT_Done_Face( face );
-        print_fterr(error, __LINE__);
-    }
+    ftw.set_pixel_size(font_size*sdf_scale);
+    ftw.load_glyph(glyph_index);
+    ftw.render_glyph();
 
     glyph new_glyph;
     
     new_glyph.charcode = charcode;
         
-    fbitmap<unsigned char> bmp(face->glyph->bitmap.width, face->glyph->bitmap.rows, (unsigned char)0);
+    fbitmap<unsigned char> bmp(ftw.glyph()->bitmap.width, ftw.glyph()->bitmap.rows, (unsigned char)0);
 
     // Copy the face bitmap into the bmp data. Freetype returns bitmaps with "pitch",
     // which is the number of bytes per row and which might be larger than the width.
 
-    int ptch = face->glyph->bitmap.pitch;
-    unsigned char *buf = face->glyph->bitmap.buffer;
+    int ptch = ftw.glyph()->bitmap.pitch;
+    unsigned char *buf = ftw.glyph()->bitmap.buffer;
     
-    for( int b_row = 0; b_row < face->glyph->bitmap.rows; ++b_row )
+    for( int b_row = 0; b_row < ftw.glyph()->bitmap.rows; ++b_row )
     {
-        for( int b_col = 0; b_col < face->glyph->bitmap.width; ++b_col )
+        for( int b_col = 0; b_col < ftw.glyph()->bitmap.width; ++b_col )
         {
-            int row_in_array = (face->glyph->bitmap.rows-1)-b_row;
+            int row_in_array = (ftw.glyph()->bitmap.rows-1)-b_row;
             unsigned char buf_byte = buf[row_in_array*ptch+b_col];
             fbmp::set(bmp, b_col, b_row, buf_byte);
         }
@@ -212,8 +287,8 @@ glyph load_glyph(FT_Face face, FT_ULong charcode, int font_size, int sdf_scale) 
         
         // Allocate low resolution buffer:
         fbitmap<double> d_bmp;
-        d_bmp.height = face->glyph->bitmap.rows/sdf_scale + master_x_pad*2;
-        d_bmp.width = face->glyph->bitmap.width/sdf_scale + master_y_pad*2;
+        d_bmp.height = ftw.glyph()->bitmap.rows/sdf_scale + master_x_pad*2;
+        d_bmp.width = ftw.glyph()->bitmap.width/sdf_scale + master_y_pad*2;
         fbmp::clear(d_bmp, 0.0);
         
         // Scale down highres buffer into lowres buffer
@@ -223,8 +298,8 @@ glyph load_glyph(FT_Face face, FT_ULong charcode, int font_size, int sdf_scale) 
         // Convert the (double *) lowres buffer into a (unsigned char *) buffer and
         // rescale values between 0 and 255.
         fbitmap<unsigned char> lo_bmp;
-        lo_bmp.height = face->glyph->bitmap.rows/sdf_scale + final_y_pad*2 ;
-        lo_bmp.width = face->glyph->bitmap.width/sdf_scale + final_x_pad*2 ;
+        lo_bmp.height = ftw.glyph()->bitmap.rows/sdf_scale + final_y_pad*2 ;
+        lo_bmp.width = ftw.glyph()->bitmap.width/sdf_scale + final_x_pad*2 ;
         fbmp::clear(lo_bmp, (unsigned char)0);
         
         int x_pad_diff = master_x_pad - final_x_pad;
@@ -244,11 +319,11 @@ glyph load_glyph(FT_Face face, FT_ULong charcode, int font_size, int sdf_scale) 
         // Distances are expressed in 26.6 grid-fitted pixels (which means that the values are
         // multiples of 64). For scalable formats, this means that the design kerning distance
         // is scaled, then rounded.
-        new_glyph.advance_x = face->glyph->advance.x/64.0f;  // advance vector is expressed in 1/64th of pixels
-        new_glyph.bearing_x = face->glyph->bitmap_left; // current pen to leftmost border of bitmap
-        new_glyph.bearing_y = face->glyph->bitmap_top; // current pen to top of bitmap
-        new_glyph.bbox_width = face->glyph->metrics.width/64.0f;
-        new_glyph.bbox_height = face->glyph->metrics.height/64.0f;
+        new_glyph.advance_x = ftw.glyph()->advance.x/64.0f;  // advance vector is expressed in 1/64th of pixels
+        new_glyph.bearing_x = ftw.glyph()->bitmap_left; // current pen to leftmost border of bitmap
+        new_glyph.bearing_y = ftw.glyph()->bitmap_top; // current pen to top of bitmap
+        new_glyph.bbox_width = ftw.glyph()->metrics.width/64.0f;
+        new_glyph.bbox_height = ftw.glyph()->metrics.height/64.0f;
         
         // Scale down dimensions by sdf_scale...
         
@@ -289,7 +364,7 @@ glyph load_glyph(FT_Face face, FT_ULong charcode, int font_size, int sdf_scale) 
 /**
  * Load all glyphs with character codes in v_charcodes from a font face.
  */
-std::map<uint32_t, glyph> load_glyphs(FT_Face face,
+std::map<uint32_t, glyph> load_glyphs(ftwrapper & ftw,
                                       int font_size,
                                       int sdf_scale,
                                       std::vector<uint32_t> const & v_charcodes) {
@@ -303,7 +378,7 @@ std::map<uint32_t, glyph> load_glyphs(FT_Face face,
             utf_append(charcode, ccode);
             std::cout << "Loading 0x" << std::hex << charcode << std::dec << "' (" << ccode << ")..." << std::endl;
         }
-        glyph new_glyph = load_glyph(face, charcode, font_size, sdf_scale);
+        glyph new_glyph = load_glyph(ftw, charcode, font_size, sdf_scale);
         glyphs[new_glyph.charcode] = new_glyph;
     }
     
@@ -377,21 +452,18 @@ bool pack_bin (std::map<uint32_t, glyph> & glyphs,
 #ifdef VERBOSENESS
             std::cout << "BMP Width: " << g.bmp.width << ", Height: " << g.bmp.height << std::endl;
 #endif
+                       
+            // x tex coordinate of top-left corner (0.0 to 1.0)
+            float s0 = (float)(output.x)/float(final_bitmap.width);
             
-            float s0=0; // x tex coordinate of top-left corner (0.0 to 1.0)
-            float t0=0; // y tex coordinate of top-left corner (0.0 to 1.0)
-            float s1=0; // x tex coordinate of bottom-right corner (0.0 to 1.0)
-            float t1=0; // y tex coordinate of bottom-right corner (0.0 to 1.0)
+            // y tex coordinate of top-left corner (0.0 to 1.0)
+            float t0 = (float)(output.y + output.height)/float(final_bitmap.height);
             
-            float x0 = output.x;
-            float y0 = output.y + output.height;
-            float x1 = output.x + output.width;
-            float y1 = output.y;
+            // x tex coordinate of bottom-right corner (0.0 to 1.0)
+            float s1 = (float)(output.x + output.width)/float(final_bitmap.width);
             
-            s0 = float(x0)/float(final_bitmap.width);
-            t0 = float(y0)/float(final_bitmap.height);
-            s1 = float(x1)/float(final_bitmap.width);
-            t1 = float(y1)/float(final_bitmap.height);
+            // y tex coordinate of bottom-right corner (0.0 to 1.0)
+            float t1 = (float)(output.y)/float(final_bitmap.height);
             
 #ifdef VERBOSENESS
             std::cout << "Packed rect x: " << output.x << ", y: " << output.y
@@ -481,27 +553,12 @@ int main( int argc, char **argv )
 
     // *** Load Font
     
-    FT_Library library;
-    FT_Error error;
+    ftwrapper ftw(font_filename);
     
-    error = FT_Init_FreeType( &library );
-    print_fterr(error, __LINE__);
-    
-    FT_Face face;
-    
-    error = FT_New_Face( library, font_filename.c_str(), 0, &face );
-    print_fterr(error, __LINE__);
-    
-    // *** Set character map.
-    
-    error = FT_Select_Charmap( face, FT_ENCODING_UNICODE );
-    if( error )
-    {
-        FT_Done_Face( face );
-        FT_Done_FreeType( library );
-        print_fterr(error, __LINE__);
+    if (! ftw.valid ) {
+        exit(0);
     }
-
+    
     // *** Find valid character codes
     
     {
@@ -524,7 +581,7 @@ int main( int argc, char **argv )
             FT_ULong gcharcode = global_charcodes[i];
             
             // retrieve glyph index from character code
-            FT_UInt glyph_index = FT_Get_Char_Index( face, gcharcode );
+            FT_UInt glyph_index = ftw.get_char_index( gcharcode );
             if(glyph_index == 0) {
                 std::string errstr;
                 utf_append(gcharcode, errstr);
@@ -548,7 +605,7 @@ int main( int argc, char **argv )
 
     do {
         font_size += 2;
-        m_glyphs = load_glyphs(face, font_size, 1, v_charcodes);
+        m_glyphs = load_glyphs(ftw, font_size, 1, v_charcodes);
         packed_successfully = pack_bin (m_glyphs, final_bitmap, v_charcodes, false);
 
     } while(packed_successfully);
@@ -563,7 +620,7 @@ int main( int argc, char **argv )
         
         int scale = 16;
         
-        m_glyphs = load_glyphs(face, font_size, scale, v_charcodes);
+        m_glyphs = load_glyphs(ftw, font_size, scale, v_charcodes);
         
         std::cout << "Packing at " << font_size << " pixels." << std::endl;
         packed_successfully = pack_bin (m_glyphs, final_bitmap, v_charcodes, true);
@@ -579,37 +636,32 @@ int main( int argc, char **argv )
     // DONE LOADING
  
     // Reset pixel size to reset metrics (below)...
-    error = FT_Set_Pixel_Sizes(face, font_size, 0);
-    if( error )
-    {
-        FT_Done_Face( face );
-        print_fterr(error, __LINE__);
-    }
+    ftw.set_pixel_size(font_size);
 
     // Generate metrics
     
-    FT_Size_Metrics metrics = face->size->metrics;
+    FT_Size_Metrics metrics = ftw.get_metrics();
     // Values are expressed in 1/64th of pixels.
     float ascender = float(metrics.ascender)/64.0f;
     float descender = float(metrics.descender)/64.0f;
     float height = float(metrics.height)/64.0f;
     float max_advance = float(metrics.max_advance)/64.0f;
+    
     float space_advance = 0;
     
     {
-        FT_UInt  space_index;
         // retrieve space index from character code
-        space_index = FT_Get_Char_Index( face, ' ' );
+        FT_UInt space_index = ftw.get_char_index( ' ' );
+        
         if(0==space_index) {
             std::cerr << "Warning: space glyph not found. Approximating space advance." << std::endl;
-            space_index = FT_Get_Char_Index( face, 'i' ); // lowercase 'i' approximates a space...
+            space_index = ftw.get_char_index( 'i' ); // lowercase 'i' approximates a space...
         }
+        
         if(space_index!=0) {
-            FT_Int32 flags = 0;
-            flags = FT_LOAD_NO_HINTING | FT_LOAD_NO_AUTOHINT;
-            error = FT_Load_Glyph( face, space_index, flags);
-            if(!error) {
-                space_advance = face->glyph->advance.x/64.0f;
+            ftw.load_glyph(space_index);
+            if(!ftw.error) {
+                space_advance = ftw.glyph()->advance.x/64.0f;
             }
         }
     }
@@ -635,17 +687,18 @@ int main( int argc, char **argv )
         FT_ULong gcharcode = v_charcodes[i];
         
         glyph& cur_glyph = m_glyphs[gcharcode];
-        FT_UInt glyph_index = FT_Get_Char_Index( face, cur_glyph.charcode );
+        FT_UInt glyph_index = ftw.get_char_index( cur_glyph.charcode );
         cur_glyph.kernings.clear();
         
         for(int j=0; j<v_charcodes.size(); j+=1)
         {
             FT_ULong prevcharcode = v_charcodes[j];
             glyph& prev_glyph = m_glyphs[prevcharcode];
-            FT_UInt prev_index = FT_Get_Char_Index( face, prev_glyph.charcode );
+            FT_UInt prev_index = ftw.get_char_index( prev_glyph.charcode );
             
             FT_Vector kerning;
-            FT_Get_Kerning( face, prev_index, glyph_index, FT_KERNING_DEFAULT, &kerning );
+            ftw.get_kerning(prev_index, glyph_index, kerning);
+
             // Default value is FT_KERNING_DEFAULT which has value 0. It corresponds to kerning
             // distances expressed in 26.6 grid-fitted pixels (which means that the values are
             // multiples of 64). For scalable formats, this means that the design kerning distance
@@ -660,11 +713,7 @@ int main( int argc, char **argv )
             }
         }
     }
-    
-    FT_Done_Face( face );
-    
-    FT_Done_FreeType( library );
- 
+     
     // WRITE THE FINAL BITMAP
     
     // the name
