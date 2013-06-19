@@ -733,22 +733,6 @@ int main( int argc, char **argv )
     
     // OUTPUT JSON DESCRIPTIONS
     
-    // Unicode is funny. Character codes are 32 bits, and they get encoded in different ways. UTF-8
-    // is probably the most portable way (no byte order issues) so it's what I'm going to use.
-    
-    // JSON is also funny. The spec gives us the fun state problem of encoding using UTF-8,
-    // escaping certain characters within strings with the \uXXXX notation; escaping other
-    // characters using a shorthand \X notation (i.e., "\"", "\\", "\/", "\b" (backspace),
-    // "\f" (form feed), "\n" (line feed), "\r" (carriage return), "\t" (tab); and escaping
-    // extended characters as \uXXXX\uXXXX which is the UTF-16 surrogate representation.
-    // I presume we don't escape using UTF-8 due to space concerns. The whole thing is gnarly.
-    // If you're UTF-8 encoded anyway, why add in an extra escape notation? Maybe to support
-    // 7-bit ASCII? If you're doing that, though, why not just require that and avoid UTF-8
-    // altogether? See http://www.ietf.org/rfc/rfc4627.txt for more details. We really only have to
-    // care about the characters that *must* be escaped: '"', '\', and the control characters
-    // 0x0000 through 0x001F.
-    
-    
     {
         float ascender = m_metrics["ascender"];
         float descender = m_metrics["descender"];
