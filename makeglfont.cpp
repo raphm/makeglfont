@@ -53,9 +53,42 @@ const struct {
 } FT_Errors[] =
 #include FT_ERRORS_H
 
+// Nemanja Trifunovic's UTF-8 translation headers.
+#include "utf8.h"
+
+// Sean Barrett's STB Image Write, to save our bitmaps.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+// Jukka Jylänki's wonderful bin packing code (http://clb.demon.fi/files/RectangleBinPack.pdf)
+#include "Rect.h"
+#include "SkylineBinPack.h"
+
+// Kazuho Oku's PicoJSON (https://github.com/kazuho/picojson)
+#include "picojson.h"
+
+// Freetype GL functions
+#include "distance_map.h"
+
+#include "fbitmap.h"
+
+
+// Define VERBOSENESS to get too much output.
+#undef VERBOSENESS
+
+
+inline void utf_append(uint32_t cp, std::string & result) {
+    char s[8];
+    char *e = utf8::append(cp, s);
+    for(char *p=s; p<e; ++p) {
+        result.push_back(*p);
+    }
+}
+
 // A little wrapper class to handle FreeType resource cleanup and whatnot.
 // I don't love these, but they tend to keep things simpler later.
-// Plus, Bjarne tells me RAII is the way to go!  :)
+// Plus, like Bjarne says: RAII is the way to go!  :)
+
 class ftwrapper {
 public:
     FT_Library library;
@@ -141,24 +174,7 @@ private:
 
 
 
-// Nemanja Trifunovic's UTF-8 translation headers.
-#include "utf8.h"
 
-// Sean Barrett's STB Image Write, to save our bitmaps.
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-
-// Jukka Jylänki's wonderful bin packing code (http://clb.demon.fi/files/RectangleBinPack.pdf)
-#include "Rect.h"
-#include "SkylineBinPack.h"
-
-// Kazuho Oku's PicoJSON (https://github.com/kazuho/picojson)
-#include "picojson.h"
-
-// Freetype GL functions
-#include "distance_map.h"
-
-#include "fbitmap.h"
 
 // See http://www.freetype.org/freetype2/docs/glyphs/glyphs-3.html for glyph metrics description
 
@@ -173,15 +189,16 @@ struct glyph
     std::map<uint32_t, float> kernings; // map of kern pairs relative to this glyph;
     // <previous character in character pair, kern value in pixels>
     float s0, t0, s1, t1; // final texture coordinates after packing.
+    
+    inline void scale (float factor) {
+        advance_x *= factor;
+        bearing_x *=factor;
+        bearing_y *=factor;
+        bbox_width *=factor;
+        bbox_height *=factor;
+    };
+    
 };
-
-inline void utf_append(uint32_t cp, std::string & result) {
-    char s[8];
-    char *e = utf8::append(cp, s);
-    for(char *p=s; p<e; ++p) {
-        result.push_back(*p);
-    }
-}
 
 /** 
  * loads a glyph from FreeType.
@@ -316,22 +333,19 @@ glyph load_glyph(ftwrapper & ftw, FT_ULong charcode, int font_size, int sdf_scal
         
         new_glyph.bmp = lo_bmp;
         
+        new_glyph.bearing_x = ftw.glyph()->bitmap_left; // current pen to leftmost border of bitmap, in pixels
+        new_glyph.bearing_y = ftw.glyph()->bitmap_top; // current pen to top of bitmap, in pixels
+
         // Distances are expressed in 26.6 grid-fitted pixels (which means that the values are
         // multiples of 64). For scalable formats, this means that the design kerning distance
         // is scaled, then rounded.
-        new_glyph.advance_x = ftw.glyph()->advance.x/64.0f;  // advance vector is expressed in 1/64th of pixels
-        new_glyph.bearing_x = ftw.glyph()->bitmap_left; // current pen to leftmost border of bitmap
-        new_glyph.bearing_y = ftw.glyph()->bitmap_top; // current pen to top of bitmap
-        new_glyph.bbox_width = ftw.glyph()->metrics.width/64.0f;
-        new_glyph.bbox_height = ftw.glyph()->metrics.height/64.0f;
+        new_glyph.advance_x = ftw.glyph()->advance.x/64.0f;        // expressed in 1/64th of pixels
+        new_glyph.bbox_width = ftw.glyph()->metrics.width/64.0f;   // expressed in 1/64th of pixels
+        new_glyph.bbox_height = ftw.glyph()->metrics.height/64.0f; // expressed in 1/64th of pixels
         
         // Scale down dimensions by sdf_scale...
         
-        new_glyph.advance_x /= (float)sdf_scale;
-        new_glyph.bearing_x /= (float)sdf_scale;
-        new_glyph.bearing_y /= (float)sdf_scale;
-        new_glyph.bbox_width /= (float)sdf_scale;
-        new_glyph.bbox_height /= (float)sdf_scale;
+        new_glyph.scale(1.0f/(float)sdf_scale);
         
         // Add padding to dimensions...
         
@@ -343,11 +357,7 @@ glyph load_glyph(ftwrapper & ftw, FT_ULong charcode, int font_size, int sdf_scal
         
         // Resize dimensions to be percentage of font size, rather than absolute pixels...
         
-        new_glyph.advance_x /= (float)font_size;
-        new_glyph.bearing_x /= (float)font_size;
-        new_glyph.bearing_y /= (float)font_size;
-        new_glyph.bbox_width /= (float)font_size;
-        new_glyph.bbox_height /= (float)font_size;
+        new_glyph.scale(1.0f/(float)font_size);
         
         // Set texture coords to 0. The bin packer fills them in.
     
@@ -507,9 +517,6 @@ bool pack_bin (std::map<uint32_t, glyph> & glyphs,
     
     return packed_successfully;
 }
-
-// Define VERBOSENESS to get a ton of output.
-#undef VERBOSENESS
 
 std::string file_to_font_name(std::string filename) {
 #ifdef _WIN32
