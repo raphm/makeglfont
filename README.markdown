@@ -38,7 +38,10 @@ code as well as below.
 
 `./glfont fontname.ttf 512`, where 512 is the bitmap size. Best if it's a power of two.
 
-You'll get a font PNG and a JSON file. Examples of how to use these are coming soon.
+You'll get a font PNG and a JSON file.
+
+An example of how to use these can be found in my
+[SDF Demonstration](https://github.com/raphm/sdf-demonstration) repository.
 
 ## Building FreeType on OS X
 
